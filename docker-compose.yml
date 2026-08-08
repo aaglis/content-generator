@@ -1,0 +1,86 @@
+# Infra local do Viral Content Factory.
+# Sobe os motores de TTS locais que o backend consome.
+#
+# Chatterbox (DEFAULT — emoção real + clonagem de voz, devnen/Chatterbox-TTS-Server):
+#   docker compose up -d chatterbox       # 1ª vez BUILDA do git (CPU, demora) + baixa o modelo
+#   docker compose logs -f chatterbox     # acompanha build/carregamento (1ª vez é lenta no CPU)
+#   Web UI / Swagger: http://localhost:8004  (/docs)
+#   Vozes: dropa um .wav/.mp3 (ex.: adam.wav, ~10s limpos) em ./chatterbox/voices/ → vira preset.
+#   Clonagem: coloque o áudio de referência em ./chatterbox/reference_audio/.
+#
+# Kokoro (alternativa, OpenAI-compat):
+#   docker compose up -d kokoro
+#
+#   docker compose ps     # status/health      docker compose down   # para tudo
+#
+# Override (opcional): crie um .env nesta pasta com CHATTERBOX_PORT / KOKORO_IMAGE / KOKORO_PORT.
+# GPU NVIDIA: troque o build do Chatterbox por Dockerfile (CUDA) + descomente o bloco `deploy:`
+#            do serviço (precisa do nvidia-container-toolkit). Idem Kokoro (imagem -gpu).
+#
+# Postgres (opcional, só quando usar Prisma) vive em docker-db/ — suba lá separadamente.
+# Backend/frontend rodam no host (bun/vite). Se containerizar o backend, troque no .env dele:
+#   CHATTERBOX_BASE_URL=http://chatterbox:8004  e  KOKORO_BASE_URL=http://kokoro:8880
+
+services:
+  chatterbox:
+    # Build CPU direto do repo oficial (sem clonar à mão). 1ª vez é lenta; depois fica em cache.
+    # Imagem pré-buildada (opcional): comente o `build:` e use `image: <sua-imagem>`.
+    build:
+      context: "https://github.com/devnen/Chatterbox-TTS-Server.git#main"
+      dockerfile: Dockerfile.cpu
+    container_name: vcf-chatterbox
+    restart: unless-stopped
+    ports:
+      - "${CHATTERBOX_PORT:-8004}:8004"
+    environment:
+      - HF_HUB_ENABLE_HF_TRANSFER=1
+      # - HF_TOKEN=${HF_TOKEN:-}   # só se algum modelo for gated
+    volumes:
+      - ./chatterbox/config.yaml:/app/config.yaml           # modelo multilingual + language pt (persiste em recreate)
+      # Fix CPU: mtl_tts.py do pacote faz torch.load de ve.pt/s3gen.pt sem map_location -> quebra no CPU.
+      # Versao corrigida (map_location=device). Sobrevive a recreate E rebuild. Conferir path se subir python.
+      - ./chatterbox/patches/mtl_tts.py:/usr/local/lib/python3.10/site-packages/chatterbox/mtl_tts.py
+      - ./chatterbox/voices:/app/voices                     # presets (seus .wav/.mp3)
+      - ./chatterbox/reference_audio:/app/reference_audio   # áudios p/ clonagem
+      - ./chatterbox/outputs:/app/outputs
+      - chatterbox_hf_cache:/app/hf_cache                   # cache do modelo (não re-baixa)
+    healthcheck:
+      # "pronto" = app de pé respondendo a lista de vozes. start_period alto: 1ª vez baixa o modelo.
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8004/get_predefined_voices', timeout=5)\" || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 600s
+    # GPU NVIDIA — troque o build p/ Dockerfile (CUDA) e descomente:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  kokoro:
+    image: ${KOKORO_IMAGE:-ghcr.io/remsky/kokoro-fastapi-cpu:latest}
+    container_name: vcf-kokoro
+    restart: unless-stopped
+    ports:
+      - "${KOKORO_PORT:-8880}:8880"
+    healthcheck:
+      # "pronto" = modelo carregado (a lista de vozes responde). Ajuste se sua versão expuser /health.
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8880/v1/audio/voices', timeout=5)\" || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    # GPU NVIDIA — use a imagem -gpu e descomente:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+volumes:
+  chatterbox_hf_cache:

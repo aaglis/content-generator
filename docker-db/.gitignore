@@ -1,0 +1,5 @@
+# Env (nunca versionar)
+.env
+
+# Volume de dados (gerenciado pelo Docker)
+data/
